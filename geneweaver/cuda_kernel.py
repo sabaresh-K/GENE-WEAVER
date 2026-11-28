@@ -5,6 +5,8 @@ Provides:
   with early mismatch-threshold exit to conserve GPU warp cycles.
 - Host orchestration function `gpu_align_sequence()` handling H2D/D2H memory transfers,
   launch grid computation via `recommend_grid_config()`, synchronization, and match extraction.
+- Memory-pooled orchestration `gpu_align_with_workspace()` utilizing `GPUMemoryBufferPool`
+  to eliminate repeated `cudaMalloc`/`cudaFree` allocations during multi-chunk streaming.
 - Full parity with `CPUAligner` and `cpu_align_sequence`, compatible with both physical
   NVIDIA GPUs and Numba's CUDA simulator (`NUMBA_ENABLE_CUDASIM=1`).
 """
@@ -18,6 +20,7 @@ import numpy as np
 from numba import cuda
 
 from geneweaver.gpu_info import recommend_grid_config
+from geneweaver.memory_manager import GPUMemoryBufferPool, TransferTimingBreakdown
 from geneweaver.parser import decode_sequence_numpy, encode_sequence_numpy
 
 # Sentinel value indicating that a sliding window exceeded the mismatch threshold
@@ -87,6 +90,7 @@ class GPUAlignmentResult:
     throughput_mbp_s: float
     blocks_launched: int
     threads_per_block: int
+    timing_breakdown: Optional[TransferTimingBreakdown] = None
 
 
 def gpu_align_sequence(
@@ -95,7 +99,7 @@ def gpu_align_sequence(
     max_mismatches: int = 3,
     threads_per_block: int = 256,
 ) -> GPUAlignmentResult:
-    """Host dispatch function executing CUDA-accelerated CRISPR sequence alignment.
+    """Host dispatch function executing CUDA-accelerated CRISPR sequence alignment with standard allocation.
 
     Args:
         genome_chunk: Genomic sequence (uint8 np.ndarray or raw string/bytes).
@@ -157,11 +161,10 @@ def gpu_align_sequence(
     blocks = grid_cfg.blocks_per_grid
     threads = grid_cfg.threads_per_block
 
-    # 3. Host-to-Device Memory Transfers
+    # 3. Host-to-Device Memory Transfers (recurrent allocation)
     t_h2d_start = time.perf_counter()
     d_genome = cuda.to_device(chunk_uint8)
     d_guide = cuda.to_device(guide_uint8)
-    # Allocate device output buffer
     d_mismatch_out = cuda.device_array(num_windows, dtype=np.uint8)
     transfer_h2d_time = time.perf_counter() - t_h2d_start
 
@@ -183,7 +186,6 @@ def gpu_align_sequence(
 
     # 6. Extract Matching Coordinates
     hits: List[GPUAlignmentHit] = []
-    # Vectorized search for candidate indices where mismatch <= max_mismatches
     matching_indices = np.where(h_mismatch_out <= max_mismatches)[0]
 
     for offset in matching_indices:
@@ -205,6 +207,18 @@ def gpu_align_sequence(
     throughput_mb_s = size_mb / total_time if total_time > 0 else 0.0
     throughput_mbp_s = size_mbp / total_time if total_time > 0 else 0.0
 
+    timing_breakdown = TransferTimingBreakdown(
+        h2d_time_ms=round(transfer_h2d_time * 1000, 3),
+        kernel_time_ms=round(kernel_time * 1000, 3),
+        d2h_time_ms=round(transfer_d2h_time * 1000, 3),
+        total_time_ms=round(total_time * 1000, 3),
+        chunk_size_bytes=chunk_len,
+        chunk_size_mb=round(size_mb, 3),
+        effective_throughput_mb_s=round(throughput_mb_s, 2),
+        kernel_throughput_mb_s=round(size_mb / kernel_time if kernel_time > 0 else 0.0, 2),
+        allocated_device_memory_mb=round((chunk_len + guide_len + num_windows) / (1024 * 1024), 3),
+    )
+
     return GPUAlignmentResult(
         hits=hits,
         kernel_time_seconds=kernel_time,
@@ -216,4 +230,156 @@ def gpu_align_sequence(
         throughput_mbp_s=throughput_mbp_s,
         blocks_launched=blocks,
         threads_per_block=threads,
+        timing_breakdown=timing_breakdown,
+    )
+
+
+def gpu_align_with_workspace(
+    workspace: GPUMemoryBufferPool,
+    genome_chunk: Union[np.ndarray, str, bytes, bytearray],
+    guide_rna: Union[np.ndarray, str, bytes, bytearray],
+    max_mismatches: int = 3,
+    threads_per_block: int = 256,
+) -> GPUAlignmentResult:
+    """Execute sequence alignment reusing pre-allocated device buffers in `workspace`.
+
+    Eliminates recurrent `cudaMalloc` and `cudaFree` driver calls across streamed chunks.
+    Automatically grows workspace buffer capacity if a chunk exceeds current dimensions.
+
+    Args:
+        workspace: Initialized `GPUMemoryBufferPool` instance.
+        genome_chunk: Genomic sequence (uint8 np.ndarray or raw string/bytes).
+        guide_rna: Query guide RNA (uint8 np.ndarray or string).
+        max_mismatches: Maximum allowable Hamming distance (default 3).
+        threads_per_block: Threads per CUDA block (default 256).
+
+    Returns:
+        GPUAlignmentResult containing hit records and detailed transfer vs compute breakdown.
+    """
+    if max_mismatches < 0:
+        raise ValueError(f"max_mismatches must be non-negative, got {max_mismatches}")
+
+    # 1. Normalize and encode input arrays to uint8
+    if isinstance(genome_chunk, np.ndarray):
+        chunk_uint8 = genome_chunk if genome_chunk.dtype == np.uint8 else genome_chunk.astype(np.uint8)
+    else:
+        chunk_uint8 = encode_sequence_numpy(genome_chunk, mode="numeric")
+
+    if isinstance(guide_rna, np.ndarray):
+        guide_uint8 = guide_rna if guide_rna.dtype == np.uint8 else guide_rna.astype(np.uint8)
+    else:
+        guide_uint8 = encode_sequence_numpy(guide_rna, mode="numeric")
+
+    chunk_len = int(chunk_uint8.shape[0])
+    guide_len = int(guide_uint8.shape[0])
+
+    if guide_len == 0:
+        raise ValueError("guide_rna cannot be empty.")
+
+    total_start = time.perf_counter()
+
+    if chunk_len < guide_len:
+        return GPUAlignmentResult(
+            hits=[],
+            kernel_time_seconds=0.0,
+            total_time_seconds=0.0,
+            transfer_h2d_seconds=0.0,
+            transfer_d2h_seconds=0.0,
+            total_bases_scanned=chunk_len,
+            throughput_mb_s=0.0,
+            throughput_mbp_s=0.0,
+            blocks_launched=0,
+            threads_per_block=threads_per_block,
+        )
+
+    num_windows = chunk_len - guide_len + 1
+
+    # 2. Ensure persistent device buffer capacity (resizes if chunk is larger than pre-allocated)
+    workspace.ensure_capacity(chunk_len=chunk_len, guide_len=guide_len)
+
+    # 3. Compute 1D Grid Launch Geometry
+    grid_cfg = recommend_grid_config(
+        sequence_length=chunk_len,
+        threads_per_block=threads_per_block,
+        guide_length=guide_len,
+    )
+    blocks = grid_cfg.blocks_per_grid
+    threads = grid_cfg.threads_per_block
+
+    # 4. Host-to-Device Memory Transfer into Pre-allocated Slices
+    t_h2d_start = time.perf_counter()
+
+    # Slice views of pre-allocated buffers matching exact chunk dimensions
+    d_chunk_slice = workspace.d_genome[:chunk_len]
+    d_guide_slice = workspace.d_guide[:guide_len]
+    d_out_slice = workspace.d_mismatch_out[:num_windows]
+
+    # Direct memory transfer into pre-existing device memory without cudaMalloc
+    d_chunk_slice.copy_to_device(chunk_uint8)
+    d_guide_slice.copy_to_device(guide_uint8)
+    transfer_h2d_time = time.perf_counter() - t_h2d_start
+
+    # 5. Kernel Execution & Synchronization
+    t_kernel_start = time.perf_counter()
+    crispr_align_kernel[blocks, threads](
+        d_chunk_slice,
+        d_guide_slice,
+        max_mismatches,
+        d_out_slice,
+    )
+    cuda.synchronize()
+    kernel_time = time.perf_counter() - t_kernel_start
+
+    # 6. Device-to-Host Memory Transfer into Pre-allocated Buffer
+    t_d2h_start = time.perf_counter()
+    h_mismatch_out = d_out_slice.copy_to_host()
+    transfer_d2h_time = time.perf_counter() - t_d2h_start
+
+    # 7. Extract Matching Coordinates
+    hits: List[GPUAlignmentHit] = []
+    matching_indices = np.where(h_mismatch_out <= max_mismatches)[0]
+
+    for offset in matching_indices:
+        mm = int(h_mismatch_out[offset])
+        window_slice = chunk_uint8[offset : offset + guide_len]
+        aligned_str = decode_sequence_numpy(window_slice, mode="numeric")
+        hits.append(
+            GPUAlignmentHit(
+                offset=int(offset),
+                mismatch_count=mm,
+                aligned_seq=aligned_str,
+            )
+        )
+
+    total_time = time.perf_counter() - total_start
+    size_mb = chunk_len / (1024 * 1024)
+    size_mbp = chunk_len / 1_000_000.0
+
+    throughput_mb_s = size_mb / total_time if total_time > 0 else 0.0
+    throughput_mbp_s = size_mbp / total_time if total_time > 0 else 0.0
+
+    timing_breakdown = TransferTimingBreakdown(
+        h2d_time_ms=round(transfer_h2d_time * 1000, 3),
+        kernel_time_ms=round(kernel_time * 1000, 3),
+        d2h_time_ms=round(transfer_d2h_time * 1000, 3),
+        total_time_ms=round(total_time * 1000, 3),
+        chunk_size_bytes=chunk_len,
+        chunk_size_mb=round(size_mb, 3),
+        effective_throughput_mb_s=round(throughput_mb_s, 2),
+        kernel_throughput_mb_s=round(size_mb / kernel_time if kernel_time > 0 else 0.0, 2),
+        allocated_device_memory_mb=workspace.allocated_memory_mb,
+    )
+
+    return GPUAlignmentResult(
+        hits=hits,
+        kernel_time_seconds=kernel_time,
+        total_time_seconds=total_time,
+        transfer_h2d_seconds=transfer_h2d_time,
+        transfer_d2h_seconds=transfer_d2h_time,
+        total_bases_scanned=chunk_len,
+        throughput_mb_s=throughput_mb_s,
+        throughput_mbp_s=throughput_mbp_s,
+        blocks_launched=blocks,
+        threads_per_block=threads,
+        timing_breakdown=timing_breakdown,
     )

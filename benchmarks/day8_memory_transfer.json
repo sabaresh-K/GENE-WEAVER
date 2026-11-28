@@ -1,0 +1,20 @@
+{
+  "benchmark": "Day8_GPU_Memory_Transfer_Benchmark",
+  "timestamp": "2026-11-28T03:15:00Z",
+  "cuda_execution_mode": "cudasim",
+  "num_chunks": 2,
+  "chunk_size_bytes": 10240,
+  "chunk_size_kb": 10.0,
+  "recurrent_allocation_total_sec": 8.4684,
+  "pooled_workspace_total_sec": 8.383,
+  "recurrent_breakdown_ms": {
+    "h2d": 0.11,
+    "kernel": 8467.9,
+    "d2h": 0.05
+  },
+  "pooled_breakdown_ms": {
+    "h2d": 0.12,
+    "kernel": 8382.41,
+    "d2h": 0.06
+  }
+}
